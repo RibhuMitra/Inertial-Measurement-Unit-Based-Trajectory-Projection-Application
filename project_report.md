@@ -40,21 +40,13 @@ where:
 
 ---
 
-#### Dynamic Debounce
+### Dynamic Debounce
 
-To prevent false detections caused by high-frequency noise or double peaks, the engine dynamically adjusts the minimum allowable time between consecutive steps.
+To prevent false detections caused by high-frequency noise or double peaks, the engine dynamically adjusts the minimum time between consecutive steps.
 
 The debounce interval is computed as:
 
-$$
-T_{\text{debounce}}
-=
-\max
-\left(
-T_{\min},
-0.6 \times T_{\text{avg}}
-\right)
-$$
+$$T_{\text{debounce}}=\max\left(T_{\min},\,0.6\times T_{\text{avg}}\right)$$
 
 where:
 
