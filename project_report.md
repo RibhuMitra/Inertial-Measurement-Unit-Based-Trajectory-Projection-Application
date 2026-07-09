@@ -19,11 +19,49 @@ To detect steps regardless of how the user holds the device, the engine dynamica
   This dynamically centers the acceleration signal around $0$, removing static gravity bias.
 
 ### 2. Step Detection & Dynamic Debounce
-Steps are identified using upward zero-crossing threshold detection:
-* **Threshold Condition**: A step is detected when $a_{\text{aligned}}$ transitions from below a threshold (`minVariation`) to above it.
-* **Dynamic Debounce**: To prevent false counts from high-frequency noise or double-peaks, the engine dynamically adjusts the lock-out period between steps:
-  $$\text{Debounce Time} = \max(\text{MIN\_TIME\_BETWEEN\_STEPS\_MS}, 0.6 \times T_{\text{avg}})$$
-  where $T_{\text{avg}}$ is the moving average of the last few valid step durations (stored in `stepTimes`).
+
+Steps are identified using **upward zero-crossing threshold detection**.
+
+#### Step Detection
+
+A step is detected when the zero-aligned filtered acceleration crosses the detection threshold in the upward direction:
+
+$$
+a_{\text{prev}} < \text{minVariation}
+\quad \land \quad
+a_{\text{curr}} > \text{minVariation}
+$$
+
+where:
+
+- $a_{\text{prev}}$ = previous filtered acceleration sample
+- $a_{\text{curr}}$ = current filtered acceleration sample
+- `minVariation` = configurable detection threshold
+
+---
+
+#### Dynamic Debounce
+
+To prevent false detections caused by high-frequency noise or double peaks, the engine dynamically adjusts the minimum allowable time between consecutive steps.
+
+The debounce interval is computed as:
+
+$$
+T_{\text{debounce}}
+=
+\max
+\left(
+T_{\min},
+0.6 \times T_{\text{avg}}
+\right)
+$$
+
+where:
+
+- $T_{\min}$ = `MIN_TIME_BETWEEN_STEPS_MS`
+- $T_{\text{avg}}$ = moving average of the most recent valid step intervals stored in `stepTimes`
+
+A new step is accepted only if the elapsed time since the previous detected step exceeds the computed debounce interval.
 
 ### 3. Weinberg Stride Length Estimation
 Rather than using a fixed step size, the engine estimates the user's stride length dynamically on each step using the **Weinberg Model**:
