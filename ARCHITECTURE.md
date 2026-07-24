@@ -1,119 +1,199 @@
-# Architecture Documentation - IMU Motion Tracer
+# System Architecture - IMU Motion Tracer
 
-This document details the system design, data flows, and software architecture of the **IMU Motion Tracer** application.
+This document describes the high-level software architecture, module interactions, threading boundaries, and data lifecycles of the **IMU Motion Tracer** application, alongside actual code implementations.
 
 ---
 
-## 1. System Overview
+## 1. High-Level Component Architecture
 
-The application is structured into three main layers: the **Android Sensor Layer** (delivering hardware sensor updates), the **Kotlin UI & Bridge Layer** (handling the Compose layout, gestures, and JNI calls), and the **Native C++ Engine** (processing dead-reckoning equations and step estimation).
-
-### High-Level Component Diagram
+The application adopts a three-tier architecture separating hardware sensor capture, native high-performance signal processing, and reactive UI rendering.
 
 ```mermaid
 graph TD
-    %% Hardware/OS level
-    subgraph OS [Android Hardware & OS]
-        Accel[Accelerometer TYPE_ACCELEROMETER]
-        Rot[Rotation Vector TYPE_ROTATION_VECTOR]
+    subgraph Hardware [Android Hardware & Sensors]
+        Accel["TYPE_ACCELEROMETER (x, y, z @ ~50Hz)"]
+        RotVec["TYPE_ROTATION_VECTOR (Quaternions)"]
+        WifiHw["Wi-Fi Chipset (Scan Results & RSSI)"]
     end
 
-    %% Kotlin UI and Bridge
-    subgraph KotlinApp [Kotlin Jetpack Compose Layer]
-        MainScreen[MainScreen Composable]
-        Listener[SensorEventListener]
-        JNIWrapper[NativeMotionEngine JNI Bridge]
+    subgraph AppLayer [Kotlin Jetpack Compose Layer]
+        Activity["MainActivity.kt"]
+        ComposeUI["MainScreen.kt (Canvas & Dashboard)"]
+        VM["MainScreenViewModel.kt"]
+        ScanManager["WifiScanManager.kt (StateFlow)"]
+        Localizer["WifiKNNLocalizer.kt (k-NN Model)"]
+        JNIBridge["NativeMotionEngine.kt Wrapper"]
     end
 
-    %% C++ Engine
-    subgraph NativeEngine [Native C++ NDK Layer]
-        JNI[JNI C-Interface]
-        Engine[MotionEngine Class]
+    subgraph NativeLayer [Native C++ NDK Engine]
+        JNIExports["extern 'C' JNI Export Functions"]
+        Engine["MotionEngine Class (C++)"]
+        Mutex["std::mutex engineMutex"]
+        Buffers["std::deque History Windows"]
     end
 
-    %% Interactions
-    Accel -->|raw x,y,z @ 50-100Hz| Listener
-    Rot -->|quaternion values| Listener
+    Accel -->|SensorEventListener| ComposeUI
+    RotVec -->|SensorEventListener| ComposeUI
+    WifiHw -->|BroadcastReceiver| ScanManager
     
-    Listener -->|processSensorData| JNIWrapper
-    Listener -->|updateHeading / addStep| JNIWrapper
-    
-    JNIWrapper -->|JNI Calls| JNI
-    JNI -->|processSensorData / updateHeading / addStep| Engine
-    
-    Engine -.->|getPathPoints / getStats| JNI
-    JNI -.->|FloatArray / telemetry stats| JNIWrapper
-    JNIWrapper -.->|Compose state updates| MainScreen
+    ScanManager -->|Live ScanResults| Localizer
+    Localizer -->|Estimated Coordinates (x, y)| ComposeUI
+
+    ComposeUI -->|processSensorData / updateHeading| JNIBridge
+    ComposeUI -->|fuseLocation(wifiX, wifiY)| JNIBridge
+
+    JNIBridge -->|JNI Calls with nativePtr| JNIExports
+    JNIExports -->|Lock & Delegate| Engine
+    Engine --- Mutex
+    Engine --- Buffers
+    Engine -.->|Interleaved pathPoints FloatArray| JNIBridge
+    JNIBridge -.->|State updates| ComposeUI
 ```
 
 ---
 
-## 2. Core Architectural Components
+## 2. Architectural Layers & Actual Code Implementations
 
-### A. Kotlin / UI Layer
-*   **[MainActivity](file:///c:/Users/user/Desktop/IMU%20Motion/app/src/main/java/com/example/imumotiontracer/MainActivity.kt)**: The entry point hosting the Compose surface.
-*   **[MainScreen](file:///c:/Users/user/Desktop/IMU%20Motion/app/src/main/java/com/example/imumotiontracer/ui/main/MainScreen.kt)**:
-    *   Manages user settings states (`stepLength`, `sensitivity`, `filterAlpha`).
-    *   Registers sensor listeners for raw Accelerometer and Rotation Vector data.
-    *   Implements an interactive vector `Canvas` that draws grid coordinates, historical walking trails, and real-time orientation indicators. Gesture listeners (`detectTransformGestures`) calculate scaling and offsets for panning and pinching.
-    *   Manages automated coroutine jobs to run simulation scripts.
-*   **[NativeMotionEngine](file:///c:/Users/user/Desktop/IMU%20Motion/app/src/main/java/com/example/imumotiontracer/NativeMotionEngine.kt)**:
-    *   Loads the native C++ library (`motion-engine`).
-    *   Instantiates the C++ backend object, holding its raw heap pointer (`nativePtr: Long`).
-    *   Acts as a thread-safe wrapper exposing simple Java-friendly methods that delegate to native functions.
+### A. Android Sensor & Hardware Ingestion
+From [`MainScreen.kt`](file:///c:/Users/user/Downloads/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main%20%281%29/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main/app/src/main/java/com/example/imumotiontracer/ui/main/MainScreen.kt):
 
-### B. C++ NDK Engine
-*   **[motion-engine.h](file:///c:/Users/user/Desktop/IMU%20Motion/app/src/main/cpp/motion-engine.h) & [motion-engine.cpp](file:///c:/Users/user/Desktop/IMU%20Motion/app/src/main/cpp/motion-engine.cpp)**:
-    *   Written in native C++ for high performance, memory efficiency, and real-time processing capability.
-    *   Implements a double-buffer design using `std::deque` history windows for low-pass and high-pass accelerometer magnitude filters.
-    *   Uses JNI (Java Native Interface) export declarations (`extern "C"`) to map Java parameters into standard C++ types.
+```kotlin
+// Sensor Event Listener setup in Jetpack Compose
+val sensorEventListener = remember {
+    object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent?) {
+            if (event == null) return
+            when (event.sensor.type) {
+                Sensor.TYPE_ACCELEROMETER -> {
+                    val x = event.values[0]
+                    val y = event.values[1]
+                    val z = event.values[2]
+                    val stepDetected = nativeEngine.processSensorData(x, y, z, event.timestamp)
+                    if (stepDetected) {
+                        nativeEngine.addStep(rawHeading, isSimulator = false)
+                    }
+                }
+                Sensor.TYPE_ROTATION_VECTOR -> {
+                    val orientation = FloatArray(3)
+                    val rotationMatrix = FloatArray(9)
+                    SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+                    SensorManager.getOrientation(rotationMatrix, orientation)
+                    val azimuthDeg = (Math.toDegrees(orientation[0].toDouble()).toFloat() + 360f) % 360f
+                    rawHeading = azimuthDeg
+                    nativeEngine.updateHeading(azimuthDeg)
+                }
+            }
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+}
+```
 
 ---
 
-## 3. Data Processing & Algorithms
+### B. Kotlin JNI Wrapper Layer
+From [`NativeMotionEngine.kt:L15-L21`](file:///c:/Users/user/Downloads/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main%20%281%29/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main/app/src/main/java/com/example/imumotiontracer/NativeMotionEngine.kt#L15-L21):
 
-### A. Vibration Filter & Step Detection
-1. **Raw Magnitude**: Acceleration vectors $(x, y, z)$ are converted to magnitude:
-   $$RawMag = \sqrt{x^2 + y^2 + z^2}$$
-2. **Dynamic Gravity Estimation**: The engine keeps a running average of `RawMag` over `AVERAGING_TIME_INTERVAL_MS` (2.5 seconds) to track local gravity forces dynamically.
-3. **Low-Pass Filter**: A second running average is calculated over `FILTER_TIME_INTERVAL_MS` (200 milliseconds) to filter out high-frequency hand vibration.
-4. **Zero-Alignment**: Gravity is subtracted from the filtered magnitude to get the motion-only acceleration signal:
-   $$FilterMagnitude = LowPassMagnitude - RunningGravity$$
-5. **Crossover Peak Detection**: A step event is registered when `FilterMagnitude` crosses from below the `sensitivity` threshold to above it, subject to dynamic debounce constraints.
-6. **Weinberg Stride Estimation**: Stride length is estimated dynamically using the peak amplitude over a 700ms window:
-   $$Stride = K \cdot \sqrt[4]{MaxMagnitude - MinMagnitude}$$
-
-### B. Heading Integration
-*   **Continuous Rotation Mapping**: The Android Rotation Vector sensor computes quaternions, which are converted to azimuth rotation angles.
-*   **High-Frequency Circular Smoothing**: Heading angles are smoothed continuously in C++ at ~50Hz:
-    $$SmoothedSin = \alpha \cdot \sin(\theta) + (1 - \alpha) \cdot SmoothedSin$$
-    $$SmoothedCos = \alpha \cdot \cos(\theta) + (1 - \alpha) \cdot SmoothedCos$$
-    $$CurrentHeading = \text{atan2}(SmoothedSin, SmoothedCos)$$
-*   **Coordinate Integration**: When a step event triggers, the engine projects the next path coordinate relative to the current position:
-    $$CurrentX = CurrentX + Stride \cdot \sin(CurrentHeading)$$
-    $$CurrentY = CurrentY - Stride \cdot \cos(CurrentHeading)$$
+```kotlin
+init {
+    // Load the shared library compiled by CMake/NDK
+    System.loadLibrary("motion-engine")
+    // Instantiate the native C++ object and store its pointer
+    nativePtr = createEngine(stepLength, sensitivity, filterAlpha)
+}
+```
 
 ---
 
-## 4. Threading & Lifecycle Model
+### C. Native C++ NDK Core Engine & Mutex Synchronization
+From [`motion-engine.cpp:L44-L46`](file:///c:/Users/user/Downloads/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main%20%281%29/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main/app/src/main/cpp/motion-engine.cpp#L44-L46):
+
+```cpp
+bool MotionEngine::processSensorData(float x, float y, float z, long long timestampNs) {
+    // Thread safety lock for all member mutations
+    std::lock_guard<std::mutex> lock(engineMutex);
+    
+    long long timestampMs = timestampNs / 1000000LL;
+    float rawMag = std::sqrt(x * x + y * y + z * z);
+    accelMeasurements.push_back(SensorSample{rawMag, timestampMs});
+    // ...
+}
+```
+
+---
+
+## 3. Threading Model & Synchronization
 
 ```
-           [Main UI / Sensor Thread]                    [NDK Mutex Boundary]
-                      │                                          │
-    SensorEvent (Accel) ───────> JNI call ─────────> lock(engineMutex) (Acquires lock)
-                                                           │     ├── processSensorData
-                                                           │     └── (returns stepDetected)
-                        <─────── Returns ─────────── unlock(engineMutex) (Releases lock)
+     [Sensor Thread / Main UI Thread]              [JNI Mutex Boundary (C++)]
+                    │                                          │
+ 1. SensorEvent (Accel @ 50Hz)                                 │
+    └─> processSensorData(x, y, z) ────────> JNI ────────> lock_guard(engineMutex)
+                                                               │  ├── Calculate Magnitude
+                                                               │  ├── Low-Pass Filtering
+                                                               │  └── Crossover Detection
+    <────────────────── returns boolean ────────────────────── unlock_guard
+                    │                                          │
+ 2. SensorEvent (Rotation @ 50Hz)                              │
+    └─> updateHeading(heading) ────────────> JNI ────────> lock_guard(engineMutex)
+                                                               │  └── Circular Smoothing
+    <────────────────── returns void ───────────────────────── unlock_guard
+                    │                                          │
+ 3. Jetpack Compose Canvas Draw                                │
+    └─> getPathPoints() ───────────────────> JNI ────────> lock_guard(engineMutex)
+                                                               │  └── Copy points vector
+    <────────────────── returns FloatArray ─────────────────── unlock_guard
 ```
 
-### Mutex Synchronization
-All read/write operations inside the C++ `MotionEngine` are synchronized using a mutex (`mutable std::mutex engineMutex`).
-This prevents race conditions between:
-*   **High-frequency continuous updates** (e.g., continuous heading updates at 50Hz).
-*   **Step events** (updating path coordinate queues at ~1Hz).
-*   **UI requests** (querying float arrays of coordinate points for redraws).
+#### 💻 C++ Mutex Implementation Block
+From [`motion-engine.cpp:L268-L277`](file:///c:/Users/user/Downloads/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main%20%281%29/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main/app/src/main/cpp/motion-engine.cpp#L268-L277):
+```cpp
+std::vector<float> MotionEngine::getPathPoints() const {
+    std::lock_guard<std::mutex> lock(engineMutex);
+    std::vector<float> points;
+    points.reserve(pathPoints.size() * 2);
+    for (const auto& pt : pathPoints) {
+        points.push_back(pt.x);
+        points.push_back(pt.y);
+    }
+    return points;
+}
+```
 
-### Memory Lifecycle
-The C++ heap memory is tied to the life of the `NativeMotionEngine` Kotlin wrapper:
-*   Created on initialization of the Jetpack Compose screen view model or remember block using JNI `createEngine`.
-*   Cleaned up surgically via JNI `destroyEngine` inside the `NativeMotionEngine.destroy()` method, called inside Jetpack Compose's `DisposableEffect` callback or Kotlin's finalizer hooks to prevent NDK memory leaks.
+---
+
+## 4. Native Memory Lifecycle Management
+
+### 💻 Heap Allocation & Deallocation Code
+From [`motion-engine.cpp:L285-L297`](file:///c:/Users/user/Downloads/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main%20%281%29/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main/app/src/main/cpp/motion-engine.cpp#L285-L297):
+
+```cpp
+JNIEXPORT jlong JNICALL
+Java_com_example_imumotiontracer_NativeMotionEngine_createEngine(
+        JNIEnv* env, jobject thiz, jfloat step_length, jfloat sensitivity, jfloat filter_alpha) {
+    auto* engine = new MotionEngine(step_length, sensitivity, filter_alpha);
+    return reinterpret_cast<jlong>(engine);
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_imumotiontracer_NativeMotionEngine_destroyEngine(
+        JNIEnv* env, jobject thiz, jlong native_ptr) {
+    auto* engine = reinterpret_cast<MotionEngine*>(native_ptr);
+    delete engine;
+}
+```
+
+And in Kotlin [`NativeMotionEngine.kt:L113-L122`](file:///c:/Users/user/Downloads/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main%20%281%29/Inertial-Measurement-Unit-Based-Trajectory-Projection-Application-main/app/src/main/java/com/example/imumotiontracer/NativeMotionEngine.kt#L113-L122):
+
+```kotlin
+fun destroy() {
+    if (nativePtr != 0L) {
+        destroyEngine(nativePtr)
+        nativePtr = 0
+    }
+}
+
+protected fun finalize() {
+    destroy()
+}
+```
